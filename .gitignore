@@ -205,3 +205,48 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+#####################################################################
+# RAG PROJECT SPECIFIC IGNORE RULES
+#####################################################################
+
+# FAISS index + metadata (large binary files, not for Git)
+models/faiss_index.bin
+models/metadata.pkl
+
+# If you ever generate more model files inside models/
+models/*.bin
+models/*.pkl
+
+# Evaluation outputs (auto-generated)
+data/eval/results.jsonl
+data/eval/ragas_dataset*.json
+
+# Logs
+data/logs/
+logs/
+*.log
+
+# Cached embeddings (if you generate them)
+data/cache/
+cache/
+*.npy
+
+# Streamlit cache
+.streamlit/
+streamlit_cache/
+
+# Temporary notebooks outputs
+*.ipynb_checkpoints/
+
+# Python pickle dumps (if created anywhere)
+*.pkl
+
+# Local environment settings
+.env
+.env.local
+.env.*.local
+
+#####################################################################
+# END OF RAG PROJECT IGNORE RULES
+#####################################################################

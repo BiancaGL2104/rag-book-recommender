@@ -1,0 +1,14 @@
+[
+  {
+    "query": "cozy fantasy romance",
+    "relevant_books": [
+      "Book A"
+    ]
+  },
+  {
+    "query": "dark academia with atmospheric writing",
+    "relevant_books": [
+      "Book B"
+    ]
+  }
+]
