@@ -1,92 +1,183 @@
 # src/retriever/vector_store.py
 
-import faiss
-import numpy as np
+from __future__ import annotations
+
+from typing import List, Dict, Any, Optional
+from pathlib import Path
 import pickle
 import os
+
+import faiss
+import numpy as np
 
 
 class VectorStore:
     """
-    Wrapper around a FAISS index + metadata.
+    Wrapper around a FAISS index and its associated metadata.
+
+    Responsibilities:
+    - store dense vectors in FAISS
+    - keep metadata aligned with vector positions
+    - provide similarity search
     """
 
-    def __init__(self, dim=None, index=None, metadata=None):
+    def __init__(
+        self,
+        dim: Optional[int] = None,
+        index: Optional[faiss.Index] = None,
+        metadata: Optional[List[Dict[str, Any]]] = None,
+    ):
         """
-        Either pass dim to create a new empty index
-        or pass an existing FAISS index.
+        Initialize a VectorStore.
+
+        Either:
+        - pass `dim` to create a new empty FAISS index, or
+        - pass an existing FAISS `index`.
+
+        Parameters
+        ----------
+        dim : int, optional
+            Embedding dimension for a new index.
+        index : faiss.Index, optional
+            Preloaded FAISS index.
+        metadata : list of dict, optional
+            Metadata entries aligned with index vectors.
         """
         if index is not None:
             self.index = index
         elif dim is not None:
             self.index = faiss.IndexFlatL2(dim)
         else:
-            raise ValueError("Must provide 'dim' or 'index'.")
+            raise ValueError("Must provide either 'dim' or 'index'.")
 
-        self.metadata = metadata or []
+        self.metadata: List[Dict[str, Any]] = metadata or []
 
     @property
-    def dim(self):
+    def dim(self) -> int:
         return self.index.d
 
-    def add(self, vectors, metas):
+    # ---------------------------
+    # Index operations
+    # ---------------------------
+
+    def add(self, vectors: np.ndarray, metas: List[Dict[str, Any]]) -> None:
         """
-        vectors: np.array [n, dim]
-        metas: list of dicts, length n
+        Add vectors and corresponding metadata to the index.
+
+        Parameters
+        ----------
+        vectors : np.ndarray
+            Array of shape (n, dim).
+        metas : list of dict
+            Metadata entries of length n.
         """
-        vectors = np.array(vectors).astype("float32")
+        vectors = np.asarray(vectors, dtype="float32")
+
+        if vectors.ndim != 2 or vectors.shape[1] != self.dim:
+            raise ValueError(
+                f"Vector dimension mismatch: expected (*, {self.dim}), "
+                f"got {vectors.shape}"
+            )
+
+        if len(vectors) != len(metas):
+            raise ValueError(
+                "Number of vectors and metadata entries must match."
+            )
+
         self.index.add(vectors)
         self.metadata.extend(metas)
 
-    def search(self, vector, k=5):
+    def search(self, vector: np.ndarray, k: int = 5) -> List[Dict[str, Any]]:
         """
-        vector: single embedding [dim]
-        returns: list of {metadata, distance}
+        Search the index for the k nearest neighbors of a query vector.
+
+        Parameters
+        ----------
+        vector : np.ndarray
+            Single embedding of shape (dim,).
+        k : int
+            Number of neighbors to retrieve.
+
+        Returns
+        -------
+        List[Dict[str, Any]]
+            Each item contains:
+            {
+                "metadata": dict,
+                "distance": float
+            }
         """
-        vector = np.array([vector]).astype("float32")
+        vector = np.asarray(vector, dtype="float32").reshape(1, -1)
+
         distances, indices = self.index.search(vector, k)
 
-        results = []
+        results: List[Dict[str, Any]] = []
         for dist, idx in zip(distances[0], indices[0]):
-            results.append(
-                {
-                    "metadata": self.metadata[idx],
-                    "distance": float(dist),
-                }
-            )
+            if idx < 0 or idx >= len(self.metadata):
+                continue
+            results.append({
+                "metadata": self.metadata[idx],
+                "distance": float(dist),
+            })
 
         return results
 
+    # ---------------------------
+    # Metadata access
+    # ---------------------------
+
+    def get_all_metadata(self) -> List[Dict[str, Any]]:
+        """
+        Return a shallow copy of all metadata entries.
+        """
+        return list(self.metadata)
+
+    # ---------------------------
+    # Persistence
+    # ---------------------------
+
     def save(
         self,
-        index_path: str = "data/models/faiss_index.bin",
-        meta_path: str = "data/models/metadata.pkl",
-    ):
+        index_path: str | Path = "data/models/faiss_index.bin",
+        meta_path: str | Path = "data/models/metadata.pkl",
+    ) -> None:
         """
-        Persist FAISS index + metadata to disk.
+        Persist the FAISS index and metadata to disk.
         """
-        os.makedirs(os.path.dirname(index_path), exist_ok=True)
+        index_path = Path(index_path)
+        meta_path = Path(meta_path)
 
-        faiss.write_index(self.index, index_path)
-        with open(meta_path, "wb") as f:
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+
+        faiss.write_index(self.index, str(index_path))
+        with meta_path.open("wb") as f:
             pickle.dump(self.metadata, f)
 
-        print(f"Saved index to {index_path}")
+        print(f"Saved FAISS index to {index_path}")
         print(f"Saved metadata to {meta_path}")
 
     @classmethod
     def load(
         cls,
-        index_path: str = "data/models/faiss_index.bin",
-        meta_path: str = "data/models/metadata.pkl",
+        index_path: str | Path = "data/models/faiss_index.bin",
+        meta_path: str | Path = "data/models/metadata.pkl",
     ) -> "VectorStore":
         """
-        Load FAISS index + metadata from disk.
+        Load a FAISS index and metadata from disk.
         """
-        index = faiss.read_index(index_path)
-        with open(meta_path, "rb") as f:
+        index_path = Path(index_path)
+        meta_path = Path(meta_path)
+
+        if not index_path.exists():
+            raise FileNotFoundError(f"FAISS index not found at {index_path}")
+        if not meta_path.exists():
+            raise FileNotFoundError(f"Metadata file not found at {meta_path}")
+
+        index = faiss.read_index(str(index_path))
+        with meta_path.open("rb") as f:
             metadata = pickle.load(f)
 
-        print(f"Loaded index from {index_path}")
+        print(f"Loaded FAISS index from {index_path}")
         print(f"Loaded metadata from {meta_path} (n={len(metadata)})")
         return cls(index=index, metadata=metadata)
