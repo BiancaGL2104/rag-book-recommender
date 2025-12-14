@@ -1,83 +1,124 @@
 # src/utils/filter_parser.py
 
+"""
+Lightweight parser for extracting numeric filters from natural language queries.
+
+Currently supports:
+- Page constraints:
+    - "under 300 pages", "below 400 pages", "less than 250 pages"
+    - "over 500 pages", "more than 200 pages", "at least 350 pages"
+    - " < 300 pages", " > 400 pages"
+- Rating constraints:
+    - "above 4 stars", "over 4.5 stars", "at least 4 stars"
+    - "rating above 4.2", "rating at least 3.8"
+    - ">= 4 stars"
+
+Returns a dict such as:
+    {
+        "max_pages": 300,
+        "min_pages": 500,
+        "min_rating": 4.0
+    }
+
+The actual application of these filters is done in the retriever / pipeline.
+"""
+
 import re
 from typing import Dict, Any
 
 
+Number = str  
+
+
+def _parse_int(value: Number) -> Any:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_float(value: Number) -> Any:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def parse_filters(query: str) -> Dict[str, Any]:
     """
-    Parse simple numeric constraints from a natural language query.
+    Extract simple numeric constraints from a natural language query.
 
-    Supports:
-      - "under 300 pages", "below 400 pages"
-      - "over 500 pages", "more than 200 pages"
-      - "above 4 stars", "over 4.5 stars", "rating at least 4 stars"
+    Parameters
+    ----------
+    query : str
+        User query (free text).
 
-    Returns a dict like:
-      {
-        "max_pages": 300,
-        "min_pages": 500,
-        "min_rating": 4.0
-      }
+    Returns
+    -------
+    Dict[str, Any]
+        Dictionary of constraints. Possible keys:
+            - "max_pages": int
+            - "min_pages": int
+            - "min_rating": float
     """
     filters: Dict[str, Any] = {}
-    q = query.lower()
+    q = (query or "").lower()
 
-    # -----------------------------
-    # PAGES: maximum (under / below)
-    # -----------------------------
     m = re.search(r"(under|below|less than)\s+(\d+)\s+pages", q)
     if m:
-        try:
-            filters["max_pages"] = int(m.group(2))
-        except ValueError:
-            pass
+        v = _parse_int(m.group(2))
+        if v is not None:
+            filters["max_pages"] = v
 
-    # Also support: "< 300 pages"
-    m = re.search(r"<\s*(\d+)\s*pages", q)
-    if m and "max_pages" not in filters:
-        try:
-            filters["max_pages"] = int(m.group(1))
-        except ValueError:
-            pass
+    if "max_pages" not in filters:
+        m = re.search(r"<\s*(\d+)\s*pages", q)
+        if m:
+            v = _parse_int(m.group(1))
+            if v is not None:
+                filters["max_pages"] = v
 
-    # -----------------------------
-    # PAGES: minimum (over / more than)
-    # -----------------------------
     m = re.search(r"(over|more than|at least)\s+(\d+)\s+pages", q)
     if m:
-        try:
-            filters["min_pages"] = int(m.group(2))
-        except ValueError:
-            pass
+        v = _parse_int(m.group(2))
+        if v is not None:
+            filters["min_pages"] = v
 
-    # Also support: "> 300 pages"
-    m = re.search(r">\s*(\d+)\s*pages", q)
-    if m and "min_pages" not in filters:
-        try:
-            filters["min_pages"] = int(m.group(1))
-        except ValueError:
-            pass
+    if "min_pages" not in filters:
+        m = re.search(r">\s*(\d+)\s*pages", q)
+        if m:
+            v = _parse_int(m.group(1))
+            if v is not None:
+                filters["min_pages"] = v
 
-    # -----------------------------
-    # RATING: minimum
-    # -----------------------------
-    # e.g., "above 4 stars", "over 4.5 stars", "rating at least 4 stars"
+    rating_pattern = r"(\d+(?:\.\d+)?)"
+
     m = re.search(
-        r"(above|over|at least)\s+(\d(\.\d)?)\s+stars", q
+        rf"(above|over|at least)\s+{rating_pattern}\s+stars?",
+        q,
     )
     if m:
-        try:
-            filters["min_rating"] = float(m.group(2))
-        except ValueError:
-            pass
+        v = _parse_float(m.group(2))
+        if v is not None:
+            filters["min_rating"] = v
 
-    # Also support: "rating >= 4" or ">= 4 stars"
-    m = re.search(r">=\s*(\d(\.\d)?)\s*stars?", q)
-    if m and "min_rating" not in filters:
-        try:
-            filters["min_rating"] = float(m.group(1))
-        except ValueError:
-            pass
+    if "min_rating" not in filters:
+        m = re.search(
+            rf"rating\s+(above|over|at least)\s+{rating_pattern}",
+            q,
+        )
+        if m:
+            v = _parse_float(m.group(2))
+            if v is not None:
+                filters["min_rating"] = v
+
+    if "min_rating" not in filters:
+        m = re.search(
+            rf">=\s*{rating_pattern}\s*stars?",
+            q,
+        )
+        if m:
+            v = _parse_float(m.group(1))
+            if v is not None:
+                filters["min_rating"] = v
 
     return filters
