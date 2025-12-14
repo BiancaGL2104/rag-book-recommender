@@ -1,247 +1,189 @@
 # src/pipeline/rag_pipeline.py
 
-from dataclasses import dataclass
-from typing import List, Dict, Any, Optional
+from typing import Optional, List, Dict, Any
+import re
+
+from src.utils.formatting import format_retrieved_books
+from src.pipeline.adapters import retrieve_books_for_llm
+from src.utils.mood import detect_mood
 
 
-@dataclass
-class RetrievedDoc:
+def _map_style_to_generator(style: Optional[str]) -> Dict[str, Optional[str]]:
     """
-    Normalized view of a retrieved book, used inside the RAG pipeline.
+    Map high-level UI styles to:
+    - generator.style ("short", "detailed", or None)
+    - personality ("friendly", "academic", etc.)
     """
-    book_id: str
-    title: str
-    author: str
-    genres: List[str]
-    rating: float
-    similarity: float
-    retrieval_text: str
+    if not style or style == "default":
+        return {"gen_style": None, "personality": None}
+
+    style = style.lower()
+
+    if style == "friendly":
+        return {"gen_style": None, "personality": "friendly"}
+    if style == "formal":
+        return {"gen_style": None, "personality": "academic"}
+    if style == "concise":
+        return {"gen_style": "short", "personality": None}
+    if style == "detailed":
+        return {"gen_style": "detailed", "personality": None}
+
+    return {"gen_style": None, "personality": None}
 
 
-def format_docs_for_llm(
-    docs: List[RetrievedDoc],
-    max_docs: int = 5,
-    max_text_chars: int = 400,
-) -> str:
+def _extract_recommended_titles(answer_text: str) -> List[str]:
     """
-    Build the context string we send to the LLM.
+    Extract book titles from the LLM answer.
+
+    Expected pattern (from your RAGGenerator):
+        * **Title** by Author — ...
+    But we allow small formatting variations.
+
+    Returns a list of unique titles in order of appearance.
     """
-    lines = []
-    for i, doc in enumerate(docs[:max_docs], start=1):
-        snippet = (doc.retrieval_text or "").strip()
-        if len(snippet) > max_text_chars:
-            snippet = snippet[: max_text_chars].rsplit(" ", 1)[0] + "..."
+    if not answer_text:
+        return []
 
-        genre_str = ", ".join(doc.genres) if doc.genres else "Unknown"
+    pattern = re.compile(r"^[\*\-\•]\s*\*\*(.+?)\*\*", re.MULTILINE)
 
-        lines.append(
-            f"[BOOK {i}]\n"
-            f"Title: {doc.title}\n"
-            f"Author: {doc.author}\n"
-            f"Genres: {genre_str}\n"
-            f"Rating: {doc.rating:.2f}\n"
-            f"Description: {snippet}\n"
-        )
+    titles: List[str] = []
+    for match in pattern.finditer(answer_text):
+        title = match.group(1).strip()
+        if title:
+            titles.append(title)
 
-    return "\n".join(lines)
+    seen = set()
+    deduped: List[str] = []
+    for t in titles:
+        key = t.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(t)
+
+    return deduped
+
+
+def _normalize_title(t: str) -> str:
+    """
+    Normalize titles for matching:
+    - lowercase
+    - strip whitespace
+    - remove surrounding punctuation
+    """
+    t = (t or "").strip().casefold()
+    t = re.sub(r"^[\W_]+|[\W_]+$", "", t)  
+    return t
 
 
 class RAGPipeline:
-    def __init__(
-        self,
-        retriever,
-        generator,
-        rating_weight: float = 0.2,
-        genre_weight: float = 0.2,
-        similarity_weight: float = 0.6,
-    ):
+    """
+    High-level RAG pipeline:
+    1. Query → Retriever (FAISS)
+    2. Raw FAISS results → adapter → book dicts for LLM
+    3. Books → formatted context string
+    4. RAGGenerator (Ollama) produces the final answer
+    """
+
+    def __init__(self, retriever, generator, k: int = 6):
         self.retriever = retriever
         self.generator = generator
-        self.rating_weight = rating_weight
-        self.genre_weight = genre_weight
-        self.similarity_weight = similarity_weight
-
-    # ----------------- helpers for reranking -----------------
-
-    def _normalize_rating(self, rating: float, max_rating: float = 5.0) -> float:
-        return max(0.0, min(rating / max_rating, 1.0))
-
-    def _estimate_genre_overlap(self, query: str, doc: RetrievedDoc) -> float:
-        """
-        Very simple genre overlap: intersect query tokens with genre tokens.
-        """
-        query_lower = query.lower()
-        q_tokens = set(query_lower.split())
-
-        if not doc.genres:
-            return 0.0
-
-        genre_tokens = set(g.lower() for g in doc.genres)
-        overlap = len(q_tokens & genre_tokens)
-
-        if overlap == 0:
-            return 0.0
-        return min(1.0, overlap / (len(q_tokens) + 1))
-
-    def rerank_docs(
-        self,
-        query: str,
-        docs: List[RetrievedDoc],
-        debug: bool = False,
-    ) -> List[Dict[str, Any]]:
-        """
-        Compute a final_score per doc using similarity + rating + genre_overlap.
-        """
-        reranked = []
-        for doc in docs:
-            sim = getattr(doc, "similarity", 0.0) or 0.0
-            rating_norm = self._normalize_rating(doc.rating)
-            genre_overlap = self._estimate_genre_overlap(query, doc)
-
-            final_score = (
-                self.similarity_weight * sim
-                + self.rating_weight * rating_norm
-                + self.genre_weight * genre_overlap
-            )
-
-            reranked.append(
-                {
-                    "doc": doc,
-                    "scores": {
-                        "similarity": sim,
-                        "rating_norm": rating_norm,
-                        "genre_overlap": genre_overlap,
-                        "final_score": final_score,
-                    },
-                }
-            )
-
-        reranked.sort(key=lambda x: x["scores"]["final_score"], reverse=True)
-
-        if debug:
-            print("\n[DEBUG] Reranking:")
-            for item in reranked:
-                d = item["doc"]
-                s = item["scores"]
-                print(
-                    f"- {d.title} | sim={s['similarity']:.3f}, "
-                    f"rating={s['rating_norm']:.3f}, "
-                    f"genre={s['genre_overlap']:.3f}, "
-                    f"final={s['final_score']:.3f}"
-                )
-
-        return reranked
-
-    # ----------------- main entry point -----------------
+        self.k = k
 
     def run(
         self,
         query: str,
-        top_k: int = 10,
-        n_recs: int = 3,
-        style: Optional[str] = None,
-        debug: bool = False,
+        style: Optional[str] = "default",
+        history: Optional[List[Dict[str, str]]] = None,
+        personality: Optional[str] = None,
+        mood: Optional[str] = None,
+        explain: bool = False,
+        second_opinion: bool = False,
     ) -> Dict[str, Any]:
-        """
-        1) Retrieve docs with retriever
-        2) Normalize into RetrievedDoc objects
-        3) Rerank
-        4) Build LLM context
-        5) Call generator
-        6) Return structured result
-        """
 
-        # 1) Retrieve using your retriever API: retrieve(query, k=top_k)
-        raw_docs = self.retriever.retrieve(query, k=top_k)
+        cleaned_query = (query or "").strip()
 
-        # If nothing found, let generator handle "no results" case
-        if not raw_docs:
-            gen_output = self.generator.generate(
-                query=query,
-                context="",
-                style=style,
-                extra={"retrieved_books": []},
-            )
-            result = {
+        if not cleaned_query:
+            return {
                 "query": query,
                 "retrieved": [],
+                "retrieved_books": [],
+                "recommended_books": [],
                 "context": "",
-                "answer": gen_output.get("answer", ""),
-                "recommended_books": gen_output.get("books", []),
-                "meta": {"reason": "no_retrieved_docs"},
+                "answer": "Please describe what kind of books you are looking for 🙂",
+                "raw_model_output": "",
+                "style": style,
+                "mood": None,
             }
-            return result
 
-        # 2) Convert raw docs (from Retriever) → RetrievedDoc
-        docs: List[RetrievedDoc] = []
-        for d in raw_docs:
-            meta = d["metadata"]
+        blocked_keywords = ["suicide", "kill myself", "self-harm", "self harm"]
+        if any(kw in cleaned_query.lower() for kw in blocked_keywords):
+            return {
+                "query": query,
+                "retrieved": [],
+                "retrieved_books": [],
+                "recommended_books": [],
+                "context": "",
+                "answer": (
+                    "I'm here to help with book recommendations, but I can't help with this topic. "
+                    "If you're struggling, please consider reaching out to a trusted person or a professional."
+                ),
+                "raw_model_output": "",
+                "style": style,
+                "mood": None,
+            }
 
-            # genres: stored as string "Fantasy, Romance" → list
-            genres_str = meta.get("genres", "")
-            genres_list = [g.strip() for g in genres_str.split(",") if g.strip()]
+        if mood is None:
+            mood = detect_mood(cleaned_query)
 
-            docs.append(
-                RetrievedDoc(
-                    book_id=meta.get("book_id", "") or meta.get("id", ""),
-                    title=meta.get("title", "Unknown Title"),
-                    author=meta.get("author", "Unknown Author"),
-                    genres=genres_list,
-                    rating=meta.get("rating", 0.0) or 0.0,
-                    similarity=d.get("similarity", 0.0),
-                    retrieval_text=meta.get("retrieval_text", "") or meta.get("description", ""),
-                )
-            )
+        raw_results = self.retriever.retrieve(cleaned_query, k=self.k)
 
-        # 3) Rerank
-        reranked = self.rerank_docs(query=query, docs=docs, debug=debug)
+        books = retrieve_books_for_llm(raw_results)
 
-        # 4) Build LLM context from top n_recs docs
-        top_docs = [item["doc"] for item in reranked[:n_recs]]
-        context = format_docs_for_llm(top_docs)
+        context = format_retrieved_books(books)
 
-        # 5) Call generator
-        gen_output = self.generator.generate(
-            query=query,
-            context=context,
-            style=style,
-            extra={
-                "retrieved_books": [
-                    {
-                        "book_id": d.book_id,
-                        "title": d.title,
-                        "author": d.author,
-                        "genres": d.genres,
-                        "rating": d.rating,
-                    }
-                    for d in top_docs
-                ]
-            },
-        )
+        style_mapping = _map_style_to_generator(style)
+        gen_style = style_mapping["gen_style"]
+        gen_personality = personality or style_mapping["personality"]
 
-        # 6) Build final result dict
-        result = {
-            "query": query,
-            "retrieved": [
-                {
-                    "book_id": item["doc"].book_id,
-                    "title": item["doc"].title,
-                    "author": item["doc"].author,
-                    "genres": item["doc"].genres,
-                    "rating": item["doc"].rating,
-                    "similarity": item["scores"]["similarity"],
-                    "genre_overlap": item["scores"]["genre_overlap"],
-                    "final_score": item["scores"]["final_score"],
-                }
-                for item in reranked
-            ],
-            "context": context,
-            "answer": gen_output.get("answer", ""),
-            "recommended_books": gen_output.get("books", []),
-            "meta": {
-                "num_retrieved": len(raw_docs),
-                "num_recommended": len(gen_output.get("books", [])),
-            },
+        extra = {
+            "explain": explain,
+            "second_opinion": second_opinion,
         }
 
-        return result
+        gen_out = self.generator.generate(
+            query=cleaned_query,
+            context=context,
+            style=gen_style,
+            history=history,
+            personality=gen_personality,
+            mood=mood,
+            extra=extra,
+        )
+
+        answer_text = gen_out.get("answer", "") or ""
+
+        recommended_titles = _extract_recommended_titles(answer_text)
+        recommended_books: List[Dict[str, Any]] = []
+
+        lookup: Dict[str, Dict[str, Any]] = {}
+        for b in books:
+            title = b.get("title") or b.get("Title") or ""
+            lookup[_normalize_title(title)] = b
+
+        for t in recommended_titles:
+            key = _normalize_title(t)
+            if key in lookup:
+                recommended_books.append(lookup[key])
+
+        return {
+            "query": cleaned_query,
+            "retrieved": raw_results,
+            "retrieved_books": books,
+            "recommended_books": recommended_books,
+            "context": context,
+            "answer": answer_text,
+            "raw_model_output": gen_out.get("raw_model_output", ""),
+            "style": style,
+            "mood": mood,
+        }
